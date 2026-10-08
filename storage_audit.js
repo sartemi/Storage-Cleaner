@@ -2,13 +2,14 @@
  * StorageAudit Pro - storage_audit.js
  * Sistem Audit Penyimpanan & Pembersih Duplikat In-Place
  * Dijalankan dengan runtime native Node.js tanpa dependensi npm eksternal.
- * Modul bawaan: http, fs, path, crypto, child_process
+ * Modul bawaan: http, fs, path, crypto, os, child_process
  */
 
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const os = require('os');
 const { exec } = require('child_process');
 
 const PORT = process.env.PORT || 3000;
@@ -68,6 +69,27 @@ function scanDirectoryRecursively(dirPath, baseDir = dirPath) {
   return results;
 }
 
+// Format MB helper (misal 61.41 MB, 18 MB, 0 B)
+function formatNumber(bytes) {
+  const mb = bytes / (1024 * 1024);
+  const rounded = Math.round(mb * 100) / 100;
+  return rounded % 1 === 0 ? rounded.toString() : rounded.toFixed(2);
+}
+
+function formatMB(bytes) {
+  if (!bytes || bytes === 0) return '0 MB';
+  const mb = bytes / (1024 * 1024);
+  const rounded = Math.round(mb * 100) / 100;
+  return (rounded % 1 === 0 ? rounded.toString() : rounded.toFixed(2)) + ' MB';
+}
+
+function formatSavings(bytes) {
+  if (!bytes || bytes === 0) return '0 B';
+  const mb = bytes / (1024 * 1024);
+  const rounded = Math.round(mb * 100) / 100;
+  return (rounded % 1 === 0 ? rounded.toString() : rounded.toFixed(2)) + ' MB';
+}
+
 // Analisis hasil pemindaian
 function processAudit(targetFolder) {
   const resolvedTarget = path.resolve(targetFolder);
@@ -91,13 +113,17 @@ function processAudit(targetFolder) {
 
     // Ambang batas File Raksasa: >= 2 MB (2.048 KB = 2,097,152 bytes)
     if (file.sizeBytes >= GIANT_THRESHOLD_BYTES) {
+      const ext = (file.name.split('.').pop() || 'FILE').toUpperCase();
       giantFiles.push({
         name: file.name,
         absolutePath: file.absolutePath,
         relativePath: file.relativePath,
         sizeBytes: file.sizeBytes,
-        sizeKB: (file.sizeBytes / 1024).toLocaleString('id-ID', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + ' KB',
-        sizeMB: (file.sizeBytes / (1024 * 1024)).toLocaleString('id-ID', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + ' MB',
+        sizeValue: formatNumber(file.sizeBytes),
+        sizeUnit: 'MB',
+        sizeFormatted: formatMB(file.sizeBytes),
+        sizeKB: (file.sizeBytes / 1024).toFixed(2) + ' KB',
+        format: ext,
         hash: file.hash,
         isTmp: file.isTmp
       });
@@ -136,10 +162,9 @@ function processAudit(targetFolder) {
         fileCount: fileList.length,
         sizeBytes: singleFileSize,
         totalSizeBytes: fileList.length * singleFileSize,
-        sizeKB: (singleFileSize / 1024).toLocaleString('id-ID', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + ' KB',
-        sizeMB: (singleFileSize / (1024 * 1024)).toLocaleString('id-ID', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + ' MB',
+        sizeMB: formatMB(singleFileSize),
         savingsBytes: groupSavings,
-        savingsMB: (groupSavings / (1024 * 1024)).toLocaleString('id-ID', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + ' MB',
+        savingsMB: formatMB(groupSavings),
         files: fileList.map((f, idx) => ({
           name: f.name,
           absolutePath: f.absolutePath,
@@ -153,7 +178,6 @@ function processAudit(targetFolder) {
 
   // Tambahkan potensi hemat dari file .tmp yang bukan bagian dari duplikat
   for (const tmp of tmpFiles) {
-    // jika bukan duplikat yang sudah dihitung
     const inDup = duplicateGroups.some(g => g.files.some(f => f.absolutePath === tmp.absolutePath && !f.isOriginal));
     if (!inDup) {
       potentialSavingsBytes += tmp.sizeBytes;
@@ -165,7 +189,7 @@ function processAudit(targetFolder) {
     resolvedTarget: resolvedTarget,
     totalFiles: allFiles.length,
     totalBytes: totalBytes,
-    totalCapacityMB: (totalBytes / (1024 * 1024)).toLocaleString('id-ID', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + ' MB',
+    totalCapacityMB: formatMB(totalBytes),
     giantCount: giantFiles.length,
     giantFiles: giantFiles,
     duplicateGroupCount: duplicateGroups.length,
@@ -180,7 +204,7 @@ function processAudit(targetFolder) {
     })),
     totalRedundantFiles: totalRedundantFiles,
     potentialSavingsBytes: potentialSavingsBytes,
-    potentialSavingsMB: (potentialSavingsBytes / (1024 * 1024)).toLocaleString('id-ID', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + ' MB'
+    potentialSavingsMB: formatSavings(potentialSavingsBytes)
   };
 }
 
@@ -241,30 +265,119 @@ function executeCleanInPlace(targetFolder) {
     deletedCount: deletedFiles.length,
     deletedFiles: deletedFiles,
     freedBytes: freedBytes,
-    freedMB: (freedBytes / (1024 * 1024)).toLocaleString('id-ID', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + ' MB',
+    freedMB: formatMB(freedBytes),
     errors: errors,
     updatedAudit: updatedAudit
   };
 }
 
-// Restore / reset helper dari cadangan lokal (jika ada)
+// Restore / reset helper dari cadangan lokal
 function restoreSampleData(targetFolder) {
-  const labSource = 'C:/Users/Student/Downloads/Downloads_Lab';
-  const resolvedTarget = path.resolve(targetFolder);
-
-  if (fs.existsSync(labSource)) {
-    if (!fs.existsSync(resolvedTarget)) {
-      fs.mkdirSync(resolvedTarget, { recursive: true });
+  const candidates = [
+    'C:/Users/Student/Desktop/Downloads_Lab_BACKUP',
+    'C:/Users/Student/Desktop/Downloads_Lab',
+    'C:/Users/Student/Downloads/Downloads_Lab',
+    path.join(__dirname, 'Bahan Latihan P12')
+  ];
+  let labSource = null;
+  for (const c of candidates) {
+    if (fs.existsSync(c) && fs.statSync(c).isDirectory()) {
+      labSource = c;
+      break;
     }
-    const files = fs.readdirSync(labSource);
-    for (const f of files) {
-      const src = path.join(labSource, f);
-      const dst = path.join(resolvedTarget, f);
+  }
+  if (!labSource) return false;
+
+  const resolvedTarget = path.resolve(targetFolder);
+  if (!fs.existsSync(resolvedTarget)) {
+    fs.mkdirSync(resolvedTarget, { recursive: true });
+  }
+
+  const files = fs.readdirSync(labSource);
+  for (const f of files) {
+    const src = path.join(labSource, f);
+    const dst = path.join(resolvedTarget, f);
+    if (fs.statSync(src).isFile()) {
       fs.copyFileSync(src, dst);
     }
-    return true;
   }
-  return false;
+  return true;
+}
+
+// Cari folder di harddisk komputer secara otomatis jika user memilih via browser file picker
+function resolveFolderOnDisk(folderName) {
+  if (!folderName) return null;
+  const home = os.homedir();
+  const directCandidates = [
+    path.join(home, 'Desktop', folderName),
+    path.join(home, 'Downloads', folderName),
+    path.join(home, 'Documents', folderName),
+    path.join(process.cwd(), folderName),
+    path.join(home, folderName),
+    path.join(process.cwd(), '..', folderName)
+  ];
+
+  for (const c of directCandidates) {
+    if (fs.existsSync(c) && fs.statSync(c).isDirectory()) {
+      return path.resolve(c);
+    }
+  }
+
+  // Pencarian 2 tingkat di folder umum
+  const roots = [
+    path.join(home, 'Desktop'),
+    path.join(home, 'Downloads'),
+    path.join(home, 'Documents'),
+    process.cwd()
+  ];
+
+  for (const root of roots) {
+    if (fs.existsSync(root)) {
+      try {
+        const items = fs.readdirSync(root, { withFileTypes: true });
+        for (const item of items) {
+          if (item.isDirectory()) {
+            if (item.name.toLowerCase() === folderName.toLowerCase()) {
+              return path.resolve(path.join(root, item.name));
+            }
+            const sub = path.join(root, item.name, folderName);
+            if (fs.existsSync(sub) && fs.statSync(sub).isDirectory()) {
+              return path.resolve(sub);
+            }
+          }
+        }
+      } catch (e) {}
+    }
+  }
+
+  return null;
+}
+
+// Buka dialog folder bawaan OS (Windows / Mac / Linux)
+function openOSFolderDialog(callback) {
+  if (process.platform === 'win32') {
+    const psCmd = `powershell -NoProfile -STA -Command "Add-Type -AssemblyName System.Windows.Forms; $f = New-Object System.Windows.Forms.FolderBrowserDialog; $f.Description = 'Pilih folder target penyimpanan yang ingin diaudit dan dibersihkan'; $top = New-Object System.Windows.Forms.Form; $top.TopMost = $true; if ($f.ShowDialog($top) -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $f.SelectedPath }"`;
+    exec(psCmd, { windowsHide: false }, (err, stdout) => {
+      if (err) return callback(err);
+      const res = stdout ? stdout.trim() : '';
+      if (!res) return callback(new Error('Pemilihan folder dibatalkan'));
+      callback(null, res);
+    });
+  } else if (process.platform === 'darwin') {
+    exec(`osascript -e 'POSIX path of (choose folder with prompt "Pilih folder target:")'`, (err, stdout) => {
+      if (err) return callback(err);
+      const res = stdout ? stdout.trim() : '';
+      if (!res) return callback(new Error('Pemilihan folder dibatalkan'));
+      callback(null, res);
+    });
+  } else {
+    exec(`zenity --file-selection --directory`, (err, stdout) => {
+      if (err) return callback(err);
+      const res = stdout ? stdout.trim() : '';
+      if (!res) return callback(new Error('Pemilihan folder dibatalkan'));
+      callback(null, res);
+    });
+  }
 }
 
 // Template HTML UI
@@ -274,35 +387,32 @@ function getHTMLTemplate() {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>StorageAudit Pro - Audit & Pembersih Penyimpanan</title>
+  <title>Storage Audit & Cleaner - Pembersihan Storage Riil di Harddisk Komputer</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:ital,wght@0,400;0,500;0,600;0,700;1,400;1,500&display=swap" rel="stylesheet">
   <style>
     :root {
-      --bg-base: #090d16;
-      --bg-surface: #0f172a;
-      --bg-card: rgba(17, 24, 39, 0.85);
-      --bg-card-hover: rgba(30, 41, 59, 0.7);
+      --bg-base: #060912;
+      --bg-card: #0b1222;
+      --bg-card-hover: #101a30;
       --border-subtle: rgba(255, 255, 255, 0.08);
-      --border-focus: rgba(99, 102, 241, 0.5);
+      --border-focus: rgba(56, 189, 248, 0.5);
       --text-main: #f8fafc;
       --text-muted: #94a3b8;
       --text-dim: #64748b;
-      --accent-primary: #6366f1;
-      --accent-primary-hover: #4f46e5;
-      --accent-emerald: #10b981;
-      --accent-emerald-dim: rgba(16, 185, 129, 0.15);
+      --accent-blue: #2563eb;
+      --accent-blue-hover: #1d4ed8;
+      --accent-cyan: #38bdf8;
+      --accent-emerald: #059669;
+      --accent-emerald-hover: #047857;
       --accent-amber: #f59e0b;
-      --accent-amber-dim: rgba(245, 158, 11, 0.15);
       --accent-rose: #ef4444;
-      --accent-rose-dim: rgba(239, 68, 68, 0.15);
-      --accent-blue: #38bdf8;
-      --radius-sm: 8px;
-      --radius-md: 12px;
-      --radius-lg: 18px;
+      --accent-crimson: #e11d48;
+      --radius-sm: 6px;
+      --radius-md: 10px;
+      --radius-lg: 14px;
       --radius-full: 9999px;
-      --shadow-glow: 0 0 25px rgba(99, 102, 241, 0.15);
     }
 
     * {
@@ -315,9 +425,9 @@ function getHTMLTemplate() {
       font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
       background-color: var(--bg-base);
       background-image: 
-        radial-gradient(circle at 15% 10%, rgba(99, 102, 241, 0.12) 0%, transparent 40%),
-        radial-gradient(circle at 85% 80%, rgba(16, 185, 129, 0.08) 0%, transparent 45%),
-        linear-gradient(180deg, #090d16 0%, #060911 100%);
+        radial-gradient(circle at 50% 0%, #0d1a34 0%, transparent 60%),
+        radial-gradient(circle at 90% 90%, rgba(16, 185, 129, 0.04) 0%, transparent 45%),
+        linear-gradient(180deg, #070c18 0%, #050811 100%);
       background-attachment: fixed;
       color: var(--text-main);
       min-height: 100vh;
@@ -333,7 +443,7 @@ function getHTMLTemplate() {
     .container {
       max-width: 1240px;
       margin: 0 auto;
-      padding: 28px 20px;
+      padding: 24px 20px;
     }
 
     /* Header */
@@ -341,9 +451,8 @@ function getHTMLTemplate() {
       display: flex;
       justify-content: space-between;
       align-items: center;
-      padding-bottom: 24px;
-      border-bottom: 1px solid var(--border-subtle);
-      margin-bottom: 28px;
+      padding-bottom: 22px;
+      margin-bottom: 24px;
       flex-wrap: wrap;
       gap: 16px;
     }
@@ -351,251 +460,275 @@ function getHTMLTemplate() {
     .brand {
       display: flex;
       align-items: center;
-      gap: 14px;
+      gap: 12px;
     }
 
-    .logo-icon {
-      width: 46px;
-      height: 46px;
-      background: linear-gradient(135deg, #6366f1 0%, #a855f7 100%);
+    .logo-box {
+      width: 42px;
+      height: 42px;
+      background: #0284c7;
       border-radius: var(--radius-md);
       display: flex;
       align-items: center;
       justify-content: center;
-      box-shadow: 0 4px 20px rgba(99, 102, 241, 0.35);
+      box-shadow: 0 4px 18px rgba(2, 132, 199, 0.45);
+      flex-shrink: 0;
     }
 
-    .logo-icon svg {
-      width: 26px;
-      height: 26px;
+    .logo-box svg {
+      width: 22px;
+      height: 22px;
       fill: white;
     }
 
-    .brand-text h1 {
-      font-size: 1.5rem;
-      font-weight: 800;
-      letter-spacing: -0.02em;
-      background: linear-gradient(90deg, #ffffff, #cbd5e1);
-      -webkit-background-clip: text;
-      -webkit-text-fill-color: transparent;
-    }
-
-    .brand-text p {
-      font-size: 0.85rem;
-      color: var(--text-muted);
-    }
-
-    .header-badge {
+    .brand-title-wrap {
       display: flex;
       align-items: center;
-      gap: 8px;
-      background: rgba(15, 23, 42, 0.8);
-      border: 1px solid var(--border-subtle);
-      padding: 6px 14px;
-      border-radius: var(--radius-full);
-      font-size: 0.78rem;
-      color: var(--text-muted);
-    }
-
-    .status-dot {
-      width: 8px;
-      height: 8px;
-      border-radius: 50%;
-      background: var(--accent-emerald);
-      box-shadow: 0 0 10px var(--accent-emerald);
-      animation: pulse 2s infinite;
-    }
-
-    @keyframes pulse {
-      0%, 100% { opacity: 1; transform: scale(1); }
-      50% { opacity: 0.5; transform: scale(0.9); }
-    }
-
-    /* Target Folder Controller */
-    .control-panel {
-      background: var(--bg-card);
-      backdrop-filter: blur(16px);
-      -webkit-backdrop-filter: blur(16px);
-      border: 1px solid var(--border-subtle);
-      border-radius: var(--radius-lg);
-      padding: 24px;
-      margin-bottom: 28px;
-      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.25);
-    }
-
-    .control-label {
-      font-size: 0.82rem;
-      font-weight: 600;
-      text-transform: uppercase;
-      letter-spacing: 0.05em;
-      color: var(--text-muted);
-      margin-bottom: 10px;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-    }
-
-    .path-input-group {
-      display: flex;
-      gap: 12px;
+      gap: 10px;
       flex-wrap: wrap;
     }
 
-    .input-wrapper {
-      position: relative;
-      flex: 1;
-      min-width: 280px;
+    .brand-title-wrap h1 {
+      font-size: 1.45rem;
+      font-weight: 800;
+      letter-spacing: -0.02em;
+      color: #ffffff;
     }
 
-    .input-wrapper svg {
-      position: absolute;
-      left: 14px;
-      top: 50%;
-      transform: translateY(-50%);
-      width: 18px;
-      height: 18px;
-      color: var(--text-dim);
+    .badge-direct {
+      background: rgba(16, 185, 129, 0.15);
+      border: 1px solid rgba(16, 185, 129, 0.4);
+      color: #10b981;
+      font-size: 0.72rem;
+      font-weight: 600;
+      padding: 2px 9px;
+      border-radius: var(--radius-full);
+      display: inline-flex;
+      align-items: center;
+      letter-spacing: 0.02em;
     }
 
-    .path-input {
-      width: 100%;
-      background: rgba(15, 23, 42, 0.9);
-      border: 1px solid rgba(255, 255, 255, 0.12);
-      color: var(--text-main);
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 0.95rem;
-      padding: 12px 14px 12px 42px;
-      border-radius: var(--radius-md);
-      transition: all 0.2s ease;
-      outline: none;
+    .brand-subtitle {
+      font-size: 0.8rem;
+      color: var(--text-muted);
+      margin-top: 2px;
     }
 
-    .path-input:focus {
-      border-color: var(--accent-primary);
-      box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.2);
+    .header-actions {
+      display: flex;
+      align-items: center;
+      gap: 12px;
     }
 
+    /* Buttons */
     .btn {
       display: inline-flex;
       align-items: center;
       justify-content: center;
       gap: 8px;
       font-weight: 600;
-      font-size: 0.9rem;
-      padding: 12px 22px;
+      font-size: 0.82rem;
+      padding: 9px 18px;
       border-radius: var(--radius-md);
       cursor: pointer;
       border: none;
       transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
       text-decoration: none;
+      user-select: none;
     }
 
     .btn:active {
       transform: scale(0.98);
     }
 
-    .btn-primary {
-      background: linear-gradient(135deg, #6366f1 0%, #4f46e5 100%);
+    .btn-header-secondary {
+      background: rgba(30, 41, 59, 0.75);
+      color: #cbd5e1;
+      border: 1px solid rgba(255, 255, 255, 0.1);
+    }
+    .btn-header-secondary:hover {
+      background: rgba(51, 65, 85, 0.85);
       color: #ffffff;
-      box-shadow: 0 4px 15px rgba(99, 102, 241, 0.3);
     }
 
-    .btn-primary:hover {
-      background: linear-gradient(135deg, #4f46e5 0%, #4338ca 100%);
-      box-shadow: 0 6px 20px rgba(99, 102, 241, 0.45);
-    }
-
-    .btn-danger {
-      background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%);
+    .btn-clean-primary {
+      background: linear-gradient(135deg, #e11d48 0%, #be123c 100%);
       color: #ffffff;
-      box-shadow: 0 4px 15px rgba(239, 68, 68, 0.3);
+      box-shadow: 0 4px 14px rgba(225, 29, 72, 0.35);
+    }
+    .btn-clean-primary:hover {
+      background: linear-gradient(135deg, #f43f5e 0%, #e11d48 100%);
+      box-shadow: 0 6px 18px rgba(225, 29, 72, 0.5);
     }
 
-    .btn-danger:hover {
-      background: linear-gradient(135deg, #dc2626 0%, #b91c1c 100%);
-      box-shadow: 0 6px 20px rgba(239, 68, 68, 0.45);
+    .btn-browse-blue {
+      background: #2563eb;
+      color: #ffffff;
+      box-shadow: 0 4px 14px rgba(37, 99, 235, 0.35);
+    }
+    .btn-browse-blue:hover {
+      background: #1d4ed8;
+      box-shadow: 0 6px 18px rgba(37, 99, 235, 0.45);
     }
 
-    .btn-secondary {
-      background: rgba(30, 41, 59, 0.8);
-      color: var(--text-muted);
+    .btn-upload-green {
+      background: #059669;
+      color: #ffffff;
+      box-shadow: 0 4px 14px rgba(5, 150, 105, 0.35);
+    }
+    .btn-upload-green:hover {
+      background: #047857;
+      box-shadow: 0 6px 18px rgba(5, 150, 105, 0.45);
+    }
+
+    .btn-input-gray {
+      background: rgba(30, 41, 59, 0.85);
+      color: #f1f5f9;
+      border: 1px solid rgba(255, 255, 255, 0.12);
+    }
+    .btn-input-gray:hover {
+      background: rgba(51, 65, 85, 0.95);
+      color: #ffffff;
+    }
+
+    /* Target Harddisk Aktif Card */
+    .target-bar-card {
+      background: var(--bg-card);
       border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-lg);
+      padding: 16px 22px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 24px;
+      flex-wrap: wrap;
+      gap: 16px;
+      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.25);
     }
 
-    .btn-secondary:hover {
-      background: rgba(51, 65, 85, 0.8);
-      color: var(--text-main);
-    }
-
-    .path-presets {
+    .target-bar-left {
       display: flex;
       align-items: center;
-      gap: 8px;
-      margin-top: 14px;
+      gap: 14px;
+      flex: 1;
+      min-width: 280px;
+    }
+
+    .folder-active-icon {
+      width: 28px;
+      height: 28px;
+      fill: #f59e0b;
+      flex-shrink: 0;
+    }
+
+    .target-label-text {
+      font-size: 0.7rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--text-dim);
+      margin-bottom: 2px;
+    }
+
+    .target-path-display {
+      font-size: 0.9rem;
+      word-break: break-all;
+    }
+
+    .target-path-display.empty {
+      color: #94a3b8;
+      font-style: italic;
+    }
+
+    .target-path-display.active {
+      color: #38bdf8;
+      font-weight: 700;
+    }
+
+    .target-bar-actions {
+      display: flex;
+      align-items: center;
+      gap: 10px;
       flex-wrap: wrap;
     }
 
-    .preset-label {
-      font-size: 0.78rem;
-      color: var(--text-dim);
+    /* Dashed Empty State Card (Pilih Folder) */
+    .empty-state-dashed-card {
+      border: 2px dashed rgba(255, 255, 255, 0.15);
+      border-radius: 16px;
+      background: rgba(11, 18, 34, 0.6);
+      padding: 44px 24px;
+      text-align: center;
+      margin-bottom: 28px;
+      transition: all 0.25s ease;
     }
 
-    .preset-chip {
-      background: rgba(30, 41, 59, 0.6);
-      border: 1px solid var(--border-subtle);
+    .empty-state-big-icon {
+      width: 54px;
+      height: 54px;
+      fill: #f59e0b;
+      margin: 0 auto 16px auto;
+      display: block;
+      filter: drop-shadow(0 4px 12px rgba(245, 158, 11, 0.3));
+    }
+
+    .empty-state-dashed-card h2 {
+      font-size: 1.35rem;
+      font-weight: 700;
+      color: #ffffff;
+      margin-bottom: 10px;
+    }
+
+    .empty-state-dashed-card p {
       color: var(--text-muted);
-      font-size: 0.75rem;
-      padding: 4px 10px;
-      border-radius: var(--radius-full);
-      cursor: pointer;
-      transition: all 0.2s ease;
-      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.88rem;
+      max-width: 620px;
+      margin: 0 auto 24px auto;
+      line-height: 1.6;
     }
 
-    .preset-chip:hover {
-      background: rgba(99, 102, 241, 0.2);
-      border-color: rgba(99, 102, 241, 0.4);
-      color: var(--text-main);
+    .empty-state-buttons {
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
     }
 
-    /* Metric Cards Grid */
+    /* 4 Stat Cards */
     .metrics-grid {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
-      gap: 18px;
-      margin-bottom: 32px;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 16px;
+      margin-bottom: 28px;
+    }
+
+    @media (max-width: 992px) {
+      .metrics-grid {
+        grid-template-columns: repeat(2, 1fr);
+      }
+    }
+
+    @media (max-width: 576px) {
+      .metrics-grid {
+        grid-template-columns: 1fr;
+      }
     }
 
     .metric-card {
       background: var(--bg-card);
-      backdrop-filter: blur(12px);
-      -webkit-backdrop-filter: blur(12px);
       border: 1px solid var(--border-subtle);
       border-radius: var(--radius-md);
-      padding: 22px;
+      padding: 20px;
       position: relative;
       overflow: hidden;
-      transition: transform 0.2s ease, border-color 0.2s ease;
+      box-shadow: 0 4px 16px rgba(0, 0, 0, 0.2);
     }
 
-    .metric-card:hover {
-      transform: translateY(-2px);
-      border-color: rgba(255, 255, 255, 0.16);
-    }
-
-    .metric-card::before {
-      content: '';
-      position: absolute;
-      top: 0;
-      left: 0;
-      right: 0;
-      height: 3px;
-    }
-
-    .metric-card.card-blue::before { background: linear-gradient(90deg, #38bdf8, #6366f1); }
-    .metric-card.card-purple::before { background: linear-gradient(90deg, #818cf8, #c084fc); }
-    .metric-card.card-amber::before { background: linear-gradient(90deg, #f59e0b, #fbbf24); }
-    .metric-card.card-emerald::before { background: linear-gradient(90deg, #10b981, #34d399); }
+    .metric-card.card-blue { border-top: 3px solid #38bdf8; }
+    .metric-card.card-purple { border-top: 3px solid #c084fc; }
+    .metric-card.card-orange { border-top: 3px solid #f87171; }
+    .metric-card.card-teal { border-top: 3px solid #2dd4bf; }
 
     .metric-header {
       display: flex;
@@ -605,181 +738,127 @@ function getHTMLTemplate() {
     }
 
     .metric-title {
-      font-size: 0.82rem;
-      font-weight: 600;
+      font-size: 0.72rem;
+      font-weight: 700;
       text-transform: uppercase;
-      letter-spacing: 0.04em;
+      letter-spacing: 0.05em;
       color: var(--text-muted);
     }
 
-    .metric-icon-wrap {
-      width: 36px;
-      height: 36px;
-      border-radius: var(--radius-sm);
+    .metric-corner-icon {
+      width: 22px;
+      height: 22px;
       display: flex;
       align-items: center;
       justify-content: center;
     }
 
-    .card-blue .metric-icon-wrap { background: rgba(56, 189, 248, 0.12); color: #38bdf8; }
-    .card-purple .metric-icon-wrap { background: rgba(168, 85, 247, 0.12); color: #c084fc; }
-    .card-amber .metric-icon-wrap { background: var(--accent-amber-dim); color: var(--accent-amber); }
-    .card-emerald .metric-icon-wrap { background: var(--accent-emerald-dim); color: var(--accent-emerald); }
-
-    .metric-icon-wrap svg {
-      width: 20px;
-      height: 20px;
-    }
+    .card-blue .metric-corner-icon svg { fill: #f59e0b; }
+    .card-purple .metric-corner-icon svg { fill: #c084fc; }
+    .card-orange .metric-corner-icon svg { fill: #f59e0b; }
+    .card-teal .metric-corner-icon svg { fill: #fbbf24; }
 
     .metric-value {
       font-size: 2rem;
       font-weight: 800;
       letter-spacing: -0.02em;
       line-height: 1.1;
-      margin-bottom: 6px;
-      color: var(--text-main);
+      margin-bottom: 8px;
+      color: #ffffff;
     }
 
     .metric-desc {
-      font-size: 0.78rem;
+      font-size: 0.74rem;
       color: var(--text-dim);
     }
 
-    /* Content Layout (Tabs / Sections) */
-    .section-tabs {
-      display: flex;
-      gap: 10px;
-      margin-bottom: 20px;
-      border-bottom: 1px solid var(--border-subtle);
-      padding-bottom: 12px;
-      flex-wrap: wrap;
-    }
-
-    .tab-btn {
-      background: transparent;
-      border: 1px solid transparent;
-      color: var(--text-muted);
-      font-size: 0.9rem;
-      font-weight: 600;
-      padding: 8px 18px;
-      border-radius: var(--radius-md);
-      cursor: pointer;
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      transition: all 0.2s ease;
-    }
-
-    .tab-btn:hover {
-      color: var(--text-main);
-      background: rgba(255, 255, 255, 0.04);
-    }
-
-    .tab-btn.active {
-      color: #ffffff;
-      background: rgba(99, 102, 241, 0.15);
-      border-color: rgba(99, 102, 241, 0.4);
-    }
-
-    .tab-badge {
-      font-size: 0.75rem;
-      padding: 2px 8px;
-      border-radius: var(--radius-full);
-      background: rgba(255, 255, 255, 0.1);
-    }
-
-    .tab-btn.active .tab-badge {
-      background: var(--accent-primary);
-      color: white;
-    }
-
-    /* Section Container */
-    .tab-content {
-      display: none;
-    }
-
-    .tab-content.active {
-      display: block;
-      animation: fadeIn 0.25s ease;
-    }
-
-    @keyframes fadeIn {
-      from { opacity: 0; transform: translateY(6px); }
-      to { opacity: 1; transform: translateY(0); }
-    }
-
-    .section-card {
+    /* Main Table Card (Daftar File Raksasa) */
+    .table-container-card {
       background: var(--bg-card);
-      backdrop-filter: blur(12px);
-      -webkit-backdrop-filter: blur(12px);
       border: 1px solid var(--border-subtle);
       border-radius: var(--radius-lg);
-      padding: 24px;
-      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.2);
+      padding: 22px;
+      margin-bottom: 28px;
+      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.25);
     }
 
-    .section-toolbar {
+    .table-toolbar {
       display: flex;
       justify-content: space-between;
       align-items: center;
       margin-bottom: 20px;
       flex-wrap: wrap;
-      gap: 12px;
+      gap: 14px;
     }
 
-    .search-input-box {
+    .table-title-area {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .cube-icon {
+      width: 22px;
+      height: 22px;
+      fill: #d97706;
+    }
+
+    .table-title-area h2 {
+      font-size: 1.05rem;
+      font-weight: 700;
+      color: #ffffff;
+    }
+
+    .count-badge-amber {
+      background: rgba(245, 158, 11, 0.2);
+      border: 1px solid rgba(245, 158, 11, 0.4);
+      color: #fbbf24;
+      font-size: 0.72rem;
+      font-weight: 600;
+      padding: 2px 8px;
+      border-radius: var(--radius-full);
+    }
+
+    .search-box {
       position: relative;
-      min-width: 260px;
-    }
-
-    .search-input-box svg {
-      position: absolute;
-      left: 12px;
-      top: 50%;
-      transform: translateY(-50%);
-      width: 16px;
-      height: 16px;
-      color: var(--text-dim);
     }
 
     .search-input {
-      width: 100%;
-      background: rgba(15, 23, 42, 0.8);
-      border: 1px solid var(--border-subtle);
+      background: rgba(15, 23, 42, 0.85);
+      border: 1px solid rgba(255, 255, 255, 0.1);
       border-radius: var(--radius-sm);
-      padding: 8px 12px 8px 36px;
-      font-size: 0.85rem;
-      color: var(--text-main);
+      padding: 8px 14px;
+      font-size: 0.82rem;
+      color: #ffffff;
       outline: none;
+      width: 220px;
+      transition: all 0.2s ease;
     }
 
     .search-input:focus {
-      border-color: var(--accent-primary);
+      border-color: #38bdf8;
+      box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.2);
     }
 
-    /* Table Styling */
     .table-responsive {
       overflow-x: auto;
-      border-radius: var(--radius-md);
-      border: 1px solid var(--border-subtle);
     }
 
     table {
       width: 100%;
       border-collapse: collapse;
       text-align: left;
-      font-size: 0.88rem;
+      font-size: 0.85rem;
     }
 
     thead th {
-      background: rgba(15, 23, 42, 0.95);
       color: var(--text-muted);
       font-weight: 600;
       text-transform: uppercase;
-      font-size: 0.74rem;
+      font-size: 0.72rem;
       letter-spacing: 0.05em;
-      padding: 14px 16px;
-      border-bottom: 1px solid var(--border-subtle);
+      padding: 12px 14px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.08);
     }
 
     tbody tr {
@@ -788,79 +867,137 @@ function getHTMLTemplate() {
     }
 
     tbody tr:hover {
-      background: rgba(255, 255, 255, 0.03);
+      background: rgba(255, 255, 255, 0.02);
     }
 
     tbody td {
-      padding: 14px 16px;
-      color: var(--text-main);
+      padding: 14px;
       vertical-align: middle;
+      color: #ffffff;
     }
 
-    .file-name-cell {
+    .file-name-wrapper {
       display: flex;
       align-items: center;
-      gap: 10px;
-      font-weight: 500;
+      gap: 12px;
     }
 
-    .file-type-icon {
-      width: 32px;
-      height: 32px;
-      border-radius: var(--radius-sm);
-      background: rgba(99, 102, 241, 0.15);
-      color: var(--accent-primary);
-      display: flex;
-      align-items: center;
-      justify-content: center;
+    .file-type-svg {
+      width: 20px;
+      height: 20px;
       flex-shrink: 0;
+      color: #94a3b8;
     }
 
-    .file-type-icon svg {
-      width: 18px;
-      height: 18px;
+    .file-name-text {
+      font-weight: 600;
+      color: #ffffff;
+      font-size: 0.88rem;
     }
 
-    .badge {
+    .file-path-text {
+      color: var(--text-dim);
+      font-size: 0.78rem;
+      word-break: break-all;
+    }
+
+    .size-stacked {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-start;
+      line-height: 1.15;
+    }
+
+    .size-stacked-num {
+      font-weight: 700;
+      font-size: 0.95rem;
+      color: #ffffff;
+    }
+
+    .size-stacked-unit {
+      font-size: 0.7rem;
+      color: var(--text-muted);
+      font-weight: 600;
+    }
+
+    .format-badge {
+      display: inline-block;
+      background: rgba(255, 255, 255, 0.08);
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      color: #cbd5e1;
+      font-size: 0.72rem;
+      font-weight: 700;
+      padding: 3px 9px;
+      border-radius: var(--radius-full);
+      font-family: 'JetBrains Mono', monospace;
+    }
+
+    .status-badge-boros {
       display: inline-flex;
+      flex-direction: column;
       align-items: center;
-      gap: 6px;
+      background: rgba(245, 158, 11, 0.15);
+      border: 1px solid rgba(245, 158, 11, 0.35);
+      color: #fbbf24;
       font-size: 0.72rem;
       font-weight: 600;
-      padding: 4px 10px;
+      padding: 3px 10px;
       border-radius: var(--radius-full);
-      text-transform: uppercase;
-      letter-spacing: 0.04em;
+      line-height: 1.2;
     }
 
-    .badge-giant {
-      background: var(--accent-amber-dim);
-      color: #fbbf24;
-      border: 1px solid rgba(245, 158, 11, 0.3);
+    .status-badge-boros .status-sub {
+      font-size: 0.68rem;
+      font-weight: 500;
+      opacity: 0.9;
     }
 
-    .badge-original {
-      background: var(--accent-emerald-dim);
-      color: #34d399;
-      border: 1px solid rgba(16, 185, 129, 0.3);
+    .table-empty-row {
+      text-align: center;
+      padding: 36px !important;
+      color: var(--text-dim);
+      font-size: 0.88rem;
     }
 
-    .badge-duplicate {
-      background: var(--accent-rose-dim);
-      color: #f87171;
-      border: 1px solid rgba(239, 68, 68, 0.3);
+    /* Accordion Kelompok Duplikat & File Sampah (Tersedia Di Bawah Tabel) */
+    .advanced-section-wrapper {
+      margin-top: 16px;
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-lg);
+      background: var(--bg-card);
+      overflow: hidden;
     }
 
-    .badge-neutral {
-      background: rgba(148, 163, 184, 0.12);
-      color: #cbd5e1;
+    .advanced-header-toggle {
+      padding: 16px 22px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      cursor: pointer;
+      background: rgba(15, 23, 42, 0.5);
+      user-select: none;
+      transition: background 0.2s ease;
     }
 
-    /* Accordion Styling */
+    .advanced-header-toggle:hover {
+      background: rgba(255, 255, 255, 0.03);
+    }
+
+    .advanced-content {
+      display: none;
+      padding: 22px;
+      border-top: 1px solid var(--border-subtle);
+    }
+
+    .advanced-content.open {
+      display: block;
+    }
+
     .accordion-list {
       display: flex;
       flex-direction: column;
-      gap: 12px;
+      gap: 10px;
+      margin-top: 14px;
     }
 
     .accordion-item {
@@ -868,810 +1005,770 @@ function getHTMLTemplate() {
       border: 1px solid var(--border-subtle);
       border-radius: var(--radius-md);
       overflow: hidden;
-      transition: all 0.2s ease;
     }
 
-    .accordion-item.open {
-      border-color: rgba(99, 102, 241, 0.4);
-      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.2);
-    }
-
-    .accordion-header {
-      padding: 16px 20px;
+    .accordion-item-header {
+      padding: 14px 18px;
       display: flex;
       justify-content: space-between;
       align-items: center;
       cursor: pointer;
       user-select: none;
-      gap: 12px;
       flex-wrap: wrap;
+      gap: 10px;
     }
 
-    .accordion-header:hover {
+    .accordion-item-header:hover {
       background: rgba(255, 255, 255, 0.02);
     }
 
-    .group-left {
-      display: flex;
-      align-items: center;
-      gap: 14px;
-      flex: 1;
-      min-width: 280px;
-    }
-
-    .group-number {
-      font-size: 0.85rem;
-      font-weight: 700;
-      color: #ffffff;
-      background: rgba(99, 102, 241, 0.2);
-      border: 1px solid rgba(99, 102, 241, 0.3);
-      padding: 4px 10px;
-      border-radius: var(--radius-sm);
-    }
-
-    .group-hash {
-      font-size: 0.8rem;
-      color: var(--text-muted);
-      display: flex;
-      align-items: center;
-      gap: 6px;
-    }
-
-    .group-hash code {
-      background: rgba(0, 0, 0, 0.3);
-      padding: 2px 6px;
-      border-radius: 4px;
-      color: #cbd5e1;
-    }
-
-    .group-right {
-      display: flex;
-      align-items: center;
-      gap: 14px;
-    }
-
-    .chevron-icon {
-      width: 20px;
-      height: 20px;
-      color: var(--text-dim);
-      transition: transform 0.2s ease;
-    }
-
-    .accordion-item.open .chevron-icon {
-      transform: rotate(180deg);
-      color: var(--accent-primary);
-    }
-
-    .accordion-body {
+    .accordion-item-body {
       display: none;
-      padding: 0 20px 18px 20px;
-      border-top: 1px solid rgba(255, 255, 255, 0.05);
-      background: rgba(10, 15, 28, 0.5);
+      padding: 14px 18px;
+      border-top: 1px solid rgba(255, 255, 255, 0.04);
+      background: rgba(8, 12, 22, 0.6);
     }
 
-    .accordion-item.open .accordion-body {
+    .accordion-item.open .accordion-item-body {
       display: block;
     }
 
-    .file-tree {
-      margin-top: 14px;
+    .file-tree-row {
       display: flex;
-      flex-direction: column;
-      gap: 8px;
-    }
-
-    .file-tree-item {
-      display: flex;
-      align-items: center;
       justify-content: space-between;
-      padding: 10px 14px;
-      background: rgba(15, 23, 42, 0.8);
-      border: 1px solid rgba(255, 255, 255, 0.05);
-      border-radius: var(--radius-sm);
+      align-items: center;
+      padding: 8px 0;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.03);
+      font-size: 0.82rem;
       gap: 12px;
-      flex-wrap: wrap;
     }
 
-    .file-tree-item.is-original {
-      border-left: 3px solid var(--accent-emerald);
-      background: rgba(16, 185, 129, 0.03);
-    }
-
-    .file-tree-item.is-duplicate {
-      border-left: 3px solid var(--accent-rose);
-      background: rgba(239, 68, 68, 0.03);
-    }
-
-    .file-info-col {
-      display: flex;
-      flex-direction: column;
-      gap: 3px;
-    }
-
-    .file-info-name {
+    .badge-original {
+      background: rgba(16, 185, 129, 0.15);
+      border: 1px solid rgba(16, 185, 129, 0.4);
+      color: #34d399;
+      font-size: 0.7rem;
       font-weight: 600;
-      font-size: 0.88rem;
+      padding: 2px 8px;
+      border-radius: var(--radius-full);
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
     }
 
-    .file-info-path {
-      font-size: 0.74rem;
-      color: var(--text-dim);
+    .badge-duplicate {
+      background: rgba(239, 68, 68, 0.15);
+      border: 1px solid rgba(239, 68, 68, 0.4);
+      color: #f87171;
+      font-size: 0.7rem;
+      font-weight: 600;
+      padding: 2px 8px;
+      border-radius: var(--radius-full);
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
     }
 
-    /* Modal */
+    /* Modal Styling */
     .modal-backdrop {
-      display: none;
       position: fixed;
-      inset: 0;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
       background: rgba(0, 0, 0, 0.75);
       backdrop-filter: blur(8px);
       -webkit-backdrop-filter: blur(8px);
-      z-index: 1000;
+      display: flex;
       align-items: center;
       justify-content: center;
+      z-index: 1000;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.25s ease;
       padding: 20px;
-      animation: fadeIn 0.2s ease;
     }
 
     .modal-backdrop.show {
-      display: flex;
+      opacity: 1;
+      pointer-events: auto;
     }
 
     .modal-dialog {
-      background: #0f172a;
+      background: #0d1527;
       border: 1px solid rgba(255, 255, 255, 0.12);
-      border-radius: var(--radius-lg);
-      max-width: 620px;
+      border-radius: 18px;
+      max-width: 520px;
       width: 100%;
+      padding: 26px;
       box-shadow: 0 20px 50px rgba(0, 0, 0, 0.6);
-      overflow: hidden;
-      animation: scaleIn 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+      transform: scale(0.95);
+      transition: transform 0.25s cubic-bezier(0.16, 1, 0.3, 1);
     }
 
-    @keyframes scaleIn {
-      from { transform: scale(0.95); opacity: 0; }
-      to { transform: scale(1); opacity: 1; }
+    .modal-backdrop.show .modal-dialog {
+      transform: scale(1);
     }
 
-    .modal-header {
-      padding: 20px 24px;
-      border-bottom: 1px solid var(--border-subtle);
-      display: flex;
-      align-items: center;
-      gap: 14px;
-      background: rgba(239, 68, 68, 0.05);
-    }
-
-    .modal-warning-icon {
-      width: 44px;
-      height: 44px;
-      border-radius: 50%;
-      background: var(--accent-rose-dim);
-      color: var(--accent-rose);
+    .modal-shield-wrap {
+      width: 48px;
+      height: 48px;
+      background: rgba(37, 99, 235, 0.15);
+      border: 1px solid rgba(37, 99, 235, 0.3);
+      border-radius: 12px;
       display: flex;
       align-items: center;
       justify-content: center;
-      flex-shrink: 0;
+      margin-bottom: 16px;
+      box-shadow: 0 0 20px rgba(37, 99, 235, 0.2);
     }
 
-    .modal-warning-icon svg {
-      width: 24px;
-      height: 24px;
+    .modal-shield-wrap svg {
+      width: 26px;
+      height: 26px;
+      fill: #38bdf8;
     }
 
-    .modal-title h3 {
-      font-size: 1.15rem;
+    .modal-dialog h3 {
+      font-size: 1.22rem;
       font-weight: 700;
+      color: #ffffff;
+      margin-bottom: 8px;
     }
 
-    .modal-title p {
-      font-size: 0.8rem;
+    .modal-subtitle {
+      font-size: 0.82rem;
       color: var(--text-muted);
+      line-height: 1.5;
     }
 
-    .modal-body {
-      padding: 24px;
-      max-height: 60vh;
-      overflow-y: auto;
+    .modal-path-highlight {
+      color: #38bdf8;
+      font-size: 0.84rem;
+      font-weight: 600;
+      word-break: break-all;
+      margin-top: 6px;
+      display: block;
     }
 
-    .clean-summary-box {
-      background: rgba(15, 23, 42, 0.9);
-      border: 1px solid var(--border-subtle);
+    .modal-stat-box {
+      background: rgba(15, 23, 42, 0.8);
+      border: 1px solid rgba(255, 255, 255, 0.08);
       border-radius: var(--radius-md);
-      padding: 16px;
-      margin-bottom: 18px;
-    }
-
-    .summary-row {
-      display: flex;
-      justify-content: space-between;
-      padding: 6px 0;
-      font-size: 0.86rem;
-      border-bottom: 1px solid rgba(255, 255, 255, 0.04);
-    }
-
-    .summary-row:last-child {
-      border-bottom: none;
-      padding-top: 10px;
-      font-weight: 700;
-    }
-
-    .file-deletion-list {
-      background: rgba(0, 0, 0, 0.25);
-      border: 1px solid rgba(255, 255, 255, 0.06);
-      border-radius: var(--radius-sm);
-      padding: 12px;
-      max-height: 180px;
-      overflow-y: auto;
-      font-size: 0.78rem;
-    }
-
-    .del-item {
-      padding: 4px 0;
-      color: #f87171;
-      display: flex;
-      align-items: center;
-      gap: 6px;
-    }
-
-    .modal-footer {
-      padding: 18px 24px;
-      border-top: 1px solid var(--border-subtle);
-      display: flex;
-      justify-content: flex-end;
-      gap: 12px;
-      background: rgba(15, 23, 42, 0.6);
-    }
-
-    /* Toast Notification */
-    .toast-container {
-      position: fixed;
-      bottom: 24px;
-      right: 24px;
-      z-index: 2000;
+      padding: 16px 18px;
+      margin: 18px 0;
       display: flex;
       flex-direction: column;
       gap: 10px;
     }
 
-    .toast {
-      background: #1e293b;
-      border: 1px solid var(--border-subtle);
-      color: var(--text-main);
-      padding: 14px 20px;
-      border-radius: var(--radius-md);
-      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4);
+    .modal-stat-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 0.82rem;
+      color: var(--text-muted);
+    }
+
+    .modal-stat-row.highlight-green {
+      border-top: 1px solid rgba(255, 255, 255, 0.08);
+      padding-top: 10px;
+      margin-top: 2px;
+      color: #ffffff;
+      font-weight: 600;
+    }
+
+    .modal-stat-row.highlight-green .val {
+      color: #10b981;
+      font-size: 1.15rem;
+      font-weight: 800;
+    }
+
+    .modal-guarantee-note {
+      font-size: 0.76rem;
+      color: var(--text-dim);
+      line-height: 1.5;
+      margin-bottom: 22px;
+    }
+
+    .modal-actions {
+      display: flex;
+      justify-content: flex-end;
+      align-items: center;
+      gap: 12px;
+    }
+
+    /* Input Path Modal */
+    .input-modal-box {
+      margin: 16px 0;
+    }
+    .input-modal-box input {
+      width: 100%;
+      background: rgba(15, 23, 42, 0.9);
+      border: 1px solid rgba(255, 255, 255, 0.15);
+      border-radius: var(--radius-sm);
+      padding: 10px 14px;
+      font-size: 0.88rem;
+      color: #ffffff;
+      outline: none;
+      font-family: 'JetBrains Mono', monospace;
+    }
+    .input-modal-box input:focus {
+      border-color: #38bdf8;
+      box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.25);
+    }
+
+    .presets-container {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 12px;
+    }
+
+    .preset-btn {
+      background: rgba(30, 41, 59, 0.8);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      color: #94a3b8;
+      font-size: 0.72rem;
+      font-family: 'JetBrains Mono', monospace;
+      padding: 5px 10px;
+      border-radius: var(--radius-full);
+      cursor: pointer;
+      transition: all 0.2s ease;
+    }
+
+    .preset-btn:hover {
+      background: rgba(56, 189, 248, 0.15);
+      border-color: rgba(56, 189, 248, 0.35);
+      color: #38bdf8;
+    }
+
+    /* Floating Toast Notifications */
+    .toast-container {
+      position: fixed;
+      bottom: 24px;
+      right: 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      z-index: 9999;
+      pointer-events: none;
+    }
+
+    .toast-item {
+      background: #0f172a;
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      border-radius: 10px;
+      padding: 12px 18px;
       display: flex;
       align-items: center;
       gap: 12px;
-      min-width: 300px;
-      animation: slideUp 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.6);
+      font-size: 0.82rem;
+      color: #ffffff;
+      max-width: 440px;
+      pointer-events: auto;
+      animation: toastSlideIn 0.25s ease;
+      transition: all 0.3s ease;
     }
 
-    @keyframes slideUp {
-      from { transform: translateY(20px); opacity: 0; }
+    @keyframes toastSlideIn {
+      from { transform: translateY(16px); opacity: 0; }
       to { transform: translateY(0); opacity: 1; }
     }
 
-    .toast.toast-success {
-      border-color: rgba(16, 185, 129, 0.4);
+    .toast-icon {
+      width: 20px;
+      height: 20px;
+      border-radius: 4px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+      font-size: 0.78rem;
+      font-weight: 800;
     }
 
-    .toast.toast-error {
-      border-color: rgba(239, 68, 68, 0.4);
+    .toast-info .toast-icon {
+      background: #0284c7;
+      color: white;
     }
 
-    /* Loading Spinner */
+    .toast-success .toast-icon {
+      background: #10b981;
+      color: white;
+    }
+
+    .toast-error .toast-icon {
+      background: #ef4444;
+      color: white;
+    }
+
     .spinner {
-      width: 18px;
-      height: 18px;
+      width: 16px;
+      height: 16px;
       border: 2px solid rgba(255, 255, 255, 0.3);
-      border-top-color: white;
       border-radius: 50%;
+      border-top-color: #ffffff;
       animation: spin 0.8s linear infinite;
     }
 
     @keyframes spin {
       to { transform: rotate(360deg); }
     }
-
-    /* Empty state */
-    .empty-state {
-      padding: 48px 20px;
-      text-align: center;
-      color: var(--text-muted);
-    }
-
-    .empty-state svg {
-      width: 48px;
-      height: 48px;
-      color: var(--text-dim);
-      margin-bottom: 12px;
-    }
-
-    /* Responsive adjustments */
-    @media (max-width: 768px) {
-      .path-input-group {
-        flex-direction: column;
-      }
-      .btn {
-        width: 100%;
-      }
-      .group-right {
-        width: 100%;
-        justify-content: space-between;
-      }
-    }
   </style>
 </head>
 <body>
 
+  <!-- Hidden HTML5 File Picker untuk Mode Upload/Pilih Folder -->
+  <input type="file" id="osFolderPickerInput" webkitdirectory directory multiple style="display:none;" onchange="handleFolderSelected(event)">
+
   <div class="container">
-    <!-- Header -->
+    
+    <!-- Top Header -->
     <header>
       <div class="brand">
-        <div class="logo-icon">
-          <svg viewBox="0 0 24 24"><path d="M19 3H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm-7 14c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5zm0-8c-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3-1.34-3-3-3z"/></svg>
+        <div class="logo-box">
+          <!-- Lightning Bolt SVG -->
+          <svg viewBox="0 0 24 24"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
         </div>
-        <div class="brand-text">
-          <h1>StorageAudit Pro</h1>
-          <p>Sistem Audit Rekursif & Pembersih Penyimpanan (Node.js Native)</p>
+        <div>
+          <div class="brand-title-wrap">
+            <h1>Storage Audit & Cleaner</h1>
+            <span class="badge-direct">Direct Execution</span>
+          </div>
+          <div class="brand-subtitle">Pembersihan Storage Riil di Harddisk Komputer</div>
         </div>
       </div>
-      <div class="header-badge">
-        <div class="status-dot"></div>
-        <span>Runtime: Node.js ${process.version} &bull; Port: ${PORT}</span>
-      </div>
-    </header>
-
-    <!-- Dynamic Control Panel -->
-    <div class="control-panel">
-      <div class="control-label">
-        <span>Target Folder Penyimpanan (Dinamis / Tidak Hardcoded)</span>
-        <span id="currentResolvedPath" class="font-mono" style="font-size:0.75rem; text-transform:none;"></span>
-      </div>
-      <div class="path-input-group">
-        <div class="input-wrapper">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"/></svg>
-          <input type="text" id="targetPathInput" class="path-input" value="${DEFAULT_TARGET_DIR}" placeholder="Masukkan path folder (contoh: ./Bahan Latihan P12)">
-        </div>
-        <button id="btnScan" class="btn btn-primary">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
-          <span>Pindai Folder</span>
+      <div class="header-actions">
+        <button id="btnRescan" class="btn btn-header-secondary" onclick="handleRescan()">
+          <!-- Refresh / Scan Icon -->
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/></svg>
+          <span>Pindai Ulang</span>
         </button>
-        <button id="btnCleanModal" class="btn btn-danger">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2M10 11v6M14 11v6"/></svg>
+        <button id="btnOpenCleanModal" class="btn btn-clean-primary" onclick="openCleanModal()">
+          <!-- Broom / Clean Icon -->
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>
           <span>Bersihkan Duplikat & Sampah</span>
         </button>
       </div>
+    </header>
 
-      <div class="path-presets">
-        <span class="preset-label">Path Cepat:</span>
-        <button class="preset-chip" onclick="setPresetPath('./Bahan Latihan P12')">./Bahan Latihan P12 (Default)</button>
-        <button class="preset-chip" onclick="setPresetPath('C:/Users/Student/Downloads/Downloads_Lab')">Downloads_Lab (Sumber Asli)</button>
-        <button class="preset-chip" onclick="setPresetPath('.')">. (Workspace Root)</button>
-        <button class="preset-chip" style="margin-left:auto; background:rgba(16,185,129,0.15); color:#34d399;" onclick="restoreLabData()">Reset / Restore Bahan Uji</button>
+    <!-- Target Harddisk Aktif Bar -->
+    <div class="target-bar-card">
+      <div class="target-bar-left">
+        <!-- Yellow Folder SVG -->
+        <svg class="folder-active-icon" viewBox="0 0 24 24"><path d="M10 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z"/></svg>
+        <div>
+          <div class="target-label-text">TARGET HARDDISK AKTIF:</div>
+          <div id="targetDisplayPath" class="target-path-display empty font-mono">Belum Ada Folder yang Dipilih</div>
+        </div>
+      </div>
+      <div class="target-bar-actions">
+
+        <button class="btn btn-upload-green" onclick="triggerHTML5Upload()">
+          <!-- Upload Icon -->
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+          <span>Pilih / Upload Folder</span>
+        </button>
+        <button class="btn btn-input-gray" onclick="openManualPathModal()">
+          <!-- Note / Input Icon -->
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
+          <span>Input Path</span>
+        </button>
       </div>
     </div>
 
-    <!-- 4 Metric Cards -->
+    <!-- Dashed Empty State Card (Pilih Folder untuk Memulai Audit) -->
+    <div id="emptyStateCard" class="empty-state-dashed-card">
+      <svg class="empty-state-big-icon" viewBox="0 0 24 24"><path d="M10 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z"/></svg>
+      <h2>Silakan Pilih Folder untuk Memulai Audit</h2>
+      <p>Belum ada folder yang dipilih. Silakan pilih folder di harddisk komputer Anda yang ingin dipindai, dianalisis file raksasanya, dan dibersihkan duplikatnya secara riil tanpa membuat salinan.</p>
+      <div class="empty-state-buttons">
+
+        <button class="btn btn-upload-green" onclick="triggerHTML5Upload()">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+          <span>Pilih / Upload Folder</span>
+        </button>
+        <button class="btn btn-input-gray" onclick="openManualPathModal()">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/></svg>
+          <span>Ketik Path Manual</span>
+        </button>
+      </div>
+    </div>
+
+    <!-- 4 Metric Stat Cards -->
     <div class="metrics-grid">
-      <!-- Total File -->
+      <!-- Card 1: Total File -->
       <div class="metric-card card-blue">
         <div class="metric-header">
-          <span class="metric-title">Total File</span>
-          <div class="metric-icon-wrap">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+          <span class="metric-title">TOTAL FILE DI-SCAN</span>
+          <div class="metric-corner-icon">
+            <svg viewBox="0 0 24 24"><path d="M10 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z"/></svg>
           </div>
         </div>
-        <div class="metric-value" id="valTotalFiles">0</div>
-        <div class="metric-desc">Semua file dipindai rekursif</div>
+        <div class="metric-value font-mono" id="statTotalFiles">-</div>
+        <div class="metric-desc">STG-01: Memindai seluruh file rekursif</div>
       </div>
 
-      <!-- Total Kapasitas -->
+      <!-- Card 2: Total Kapasitas -->
       <div class="metric-card card-purple">
         <div class="metric-header">
-          <span class="metric-title">Total Kapasitas</span>
-          <div class="metric-icon-wrap">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>
+          <span class="metric-title">TOTAL KAPASITAS FOLDER</span>
+          <div class="metric-corner-icon">
+            <svg viewBox="0 0 24 24"><path d="M17 3H5c-1.11 0-2 .9-2 2v14c0 1.1.89 2 2 2h14c1.1 0 2-.9 2-2V7l-4-4zm-5 16c-1.66 0-3-1.34-3-3s1.34-3 3-3 3 1.34 3 3-1.34 3-3 3zm3-10H5V5h10v4z"/></svg>
           </div>
         </div>
-        <div class="metric-value" id="valTotalCapacity">0 MB</div>
-        <div class="metric-desc" id="valTotalBytes">0 bytes</div>
+        <div class="metric-value font-mono" id="statTotalCapacity">-</div>
+        <div class="metric-desc">Ukuran data fisik asli di disk</div>
       </div>
 
-      <!-- File Raksasa (> 2 MB) -->
-      <div class="metric-card card-amber">
+      <!-- Card 3: File Raksasa -->
+      <div class="metric-card card-orange">
         <div class="metric-header">
-          <span class="metric-title">File Raksasa</span>
-          <div class="metric-icon-wrap">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+          <span class="metric-title">FILE RAKSASA (≥ 2 MB)</span>
+          <div class="metric-corner-icon">
+            <svg viewBox="0 0 24 24"><path d="M1 21h22L12 2 1 21zm12-3h-2v-2h2v2zm0-4h-2v-4h2v4z"/></svg>
           </div>
         </div>
-        <div class="metric-value" id="valGiantFiles">0</div>
-        <div class="metric-desc">Ukuran melebihi 2 MB (2.048 KB)</div>
+        <div class="metric-value font-mono" id="statGiantFiles">-</div>
+        <div class="metric-desc">STG-03: Terdeteksi file boros kuota</div>
       </div>
 
-      <!-- Potensi Hemat -->
-      <div class="metric-card card-emerald">
+      <!-- Card 4: Potensi Hemat -->
+      <div class="metric-card card-teal">
         <div class="metric-header">
-          <span class="metric-title">Potensi Hemat</span>
-          <div class="metric-icon-wrap">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2v20M17 5H9.5a3.5 3.5 0 000 7h5a3.5 3.5 0 010 7H6"/></svg>
+          <span class="metric-title">POTENSI HEMAT RUANG</span>
+          <div class="metric-corner-icon">
+            <svg viewBox="0 0 24 24"><path d="M12 2L9.19 8.63 2 9.24l5.46 4.73L5.82 21 12 17.27 18.18 21l-1.64-7.03L22 9.24l-7.19-.61L12 2z"/></svg>
           </div>
         </div>
-        <div class="metric-value" id="valPotentialSavings">0 MB</div>
-        <div class="metric-desc" id="valRedundantFilesCount">0 salinan kembar</div>
+        <div class="metric-value font-mono" id="statPotentialSavings">-</div>
+        <div class="metric-desc">Duplikat identik &amp; file sampah .tmp</div>
       </div>
     </div>
 
-    <!-- Section Tabs -->
-    <div class="section-tabs">
-      <button class="tab-btn active" onclick="switchTab('tab-giants')">
-        <span>File Raksasa</span>
-        <span class="tab-badge" id="badgeGiantsCount">0</span>
-      </button>
-      <button class="tab-btn" onclick="switchTab('tab-duplicates')">
-        <span>Kelompok Duplikat</span>
-        <span class="tab-badge" id="badgeDuplicatesCount">0</span>
-      </button>
-      <button class="tab-btn" onclick="switchTab('tab-tmp')">
-        <span>File Sampah (.tmp)</span>
-        <span class="tab-badge" id="badgeTmpCount">0</span>
-      </button>
-    </div>
-
-    <!-- TAB 1: File Raksasa -->
-    <div id="tab-giants" class="tab-content active">
-      <div class="section-card">
-        <div class="section-toolbar">
-          <div>
-            <h2 style="font-size:1.15rem; font-weight:700;">Daftar File Raksasa (&ge; 2 MB / 2.048 KB)</h2>
-            <p style="font-size:0.8rem; color:var(--text-muted);">Diurutkan berdasarkan ukuran file terbesar yang memakan kapasitas penyimpanan</p>
-          </div>
-          <div class="search-input-box">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
-            <input type="text" id="searchGiant" class="search-input" placeholder="Cari file raksasa..." oninput="filterGiantsTable()">
-          </div>
+    <!-- Tabel File Raksasa Card -->
+    <div class="table-container-card">
+      <div class="table-toolbar">
+        <div class="table-title-area">
+          <svg class="cube-icon" viewBox="0 0 24 24"><path d="M21 16.5c0 .38-.21.71-.53.88l-7.9 4.44c-.16.12-.36.18-.57.18s-.41-.06-.57-.18l-7.9-4.44A.991.991 0 0 1 3 16.5v-9c0-.38.21-.71.53-.88l7.9-4.44c.16-.12.36-.18.57-.18s.41.06.57.18l7.9 4.44c.32.17.53.5.53.88v9z"/></svg>
+          <h2>Daftar File Raksasa (≥ 2 MB)</h2>
+          <span class="count-badge-amber" id="badgeGiantCount">0 file</span>
         </div>
-
-        <div class="table-responsive">
-          <table>
-            <thead>
-              <tr>
-                <th style="width: 50px;">No</th>
-                <th>Nama File</th>
-                <th>Ukuran (MB)</th>
-                <th>Ukuran (KB)</th>
-                <th>Path Relatif</th>
-                <th>Kategori</th>
-              </tr>
-            </thead>
-            <tbody id="giantTableBody">
-              <!-- Render via JS -->
-            </tbody>
-          </table>
+        <div class="search-box">
+          <input type="text" id="giantSearchInput" class="search-input" placeholder="Cari file raksasa..." oninput="handleFilterGiants()">
         </div>
+      </div>
+
+      <div class="table-responsive">
+        <table>
+          <thead>
+            <tr>
+              <th style="width: 32%;">NAMA FILE</th>
+              <th style="width: 44%;">PATH LOKASI HARDDISK</th>
+              <th style="width: 10%;">UKURAN</th>
+              <th style="width: 7%;">FORMAT</th>
+              <th style="width: 7%;">STATUS</th>
+            </tr>
+          </thead>
+          <tbody id="giantTableBody">
+            <tr>
+              <td colspan="5" class="table-empty-row">Belum ada folder yang dipilih untuk diaudit.</td>
+            </tr>
+          </tbody>
+        </table>
       </div>
     </div>
 
-    <!-- TAB 2: Kelompok Duplikat -->
-    <div id="tab-duplicates" class="tab-content">
-      <div class="section-card">
-        <div class="section-toolbar">
-          <div>
-            <h2 style="font-size:1.15rem; font-weight:700;">Kelompok File Duplikat (SHA-256 Identik)</h2>
-            <p style="font-size:0.8rem; color:var(--text-muted);">Dikelompokkan berdasarkan hash isi file. 1 file orisinil dipertahankan dan sisanya dapat dibersihkan.</p>
-          </div>
-          <div style="display:flex; gap:10px; align-items:center;">
-            <button class="btn btn-secondary" style="padding:6px 14px; font-size:0.8rem;" onclick="toggleAllAccordions(true)">Buka Semua</button>
-            <button class="btn btn-secondary" style="padding:6px 14px; font-size:0.8rem;" onclick="toggleAllAccordions(false)">Tutup Semua</button>
-            <div class="search-input-box">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
-              <input type="text" id="searchDups" class="search-input" placeholder="Cari duplikat..." oninput="filterDuplicates()">
-            </div>
-          </div>
+    <!-- Section Lanjutan: Detail Kelompok Duplikat & File Sampah (Sesuai Kepatuhan SRS / README) -->
+    <div class="advanced-section-wrapper" id="advancedSectionWrapper" style="display:none;">
+      <div class="advanced-header-toggle" onclick="toggleAdvancedSection()">
+        <div style="display:flex; align-items:center; gap:10px;">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+          <span style="font-weight:700; font-size:0.92rem; color:#ffffff;">Rincian Kelompok Duplikat (SHA-256) &amp; Sampah .tmp</span>
+          <span class="count-badge-amber" id="badgeDupGroupCount">0 grup</span>
         </div>
-
+        <div style="font-size:0.78rem; color:var(--text-muted); display:flex; align-items:center; gap:6px;">
+          <span id="txtToggleAdvanced">Klik untuk melihat detail file duplikat</span>
+          <svg id="arrowToggleAdvanced" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
+        </div>
+      </div>
+      <div class="advanced-content" id="advancedContent">
+        <p style="font-size:0.8rem; color:var(--text-muted); margin-bottom:12px;">
+          Setiap grup membandingkan hash file SHA-256 yang identik. Sistem menjamin 1 file orisinil dipertahankan dan sisanya dibersihkan.
+        </p>
         <div class="accordion-list" id="duplicateAccordionList">
           <!-- Render via JS -->
         </div>
       </div>
     </div>
 
-    <!-- TAB 3: File Sampah (.tmp) -->
-    <div id="tab-tmp" class="tab-content">
-      <div class="section-card">
-        <div class="section-toolbar">
-          <div>
-            <h2 style="font-size:1.15rem; font-weight:700;">File Sampah Sementara (.tmp)</h2>
-            <p style="font-size:0.8rem; color:var(--text-muted);">File sementara yang aman untuk dibersihkan secara in-place</p>
-          </div>
-        </div>
-        <div class="table-responsive">
-          <table>
-            <thead>
-              <tr>
-                <th style="width: 50px;">No</th>
-                <th>Nama File</th>
-                <th>Ukuran</th>
-                <th>Path Absolut</th>
-                <th>Status</th>
-              </tr>
-            </thead>
-            <tbody id="tmpTableBody">
-              <!-- Render via JS -->
-            </tbody>
-          </table>
-        </div>
-      </div>
-    </div>
-
   </div>
 
-  <!-- Interactive Confirmation Modal -->
-  <div id="confirmModal" class="modal-backdrop">
+  <!-- Modal Konfirmasi Pembersihan Harddisk Asli -->
+  <div id="cleanConfirmModal" class="modal-backdrop">
     <div class="modal-dialog">
-      <div class="modal-header">
-        <div class="modal-warning-icon">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
-        </div>
-        <div class="modal-title">
-          <h3>Konfirmasi Pembersihan In-Place</h3>
-          <p>Tindakan ini menghapus file secara permanen di folder target</p>
-        </div>
+      <div class="modal-shield-wrap">
+        <svg viewBox="0 0 24 24"><path d="M12 1L3 5v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V5l-9-4zm0 10.99h7c-.53 4.12-3.28 7.79-7 8.94V12H5V6.3l7-3.11v8.8z"/></svg>
       </div>
-      <div class="modal-body">
-        <div class="clean-summary-box">
-          <div class="summary-row">
-            <span style="color:var(--text-muted);">Target Folder:</span>
-            <span class="font-mono" id="modalTargetFolder" style="font-weight:600;"></span>
-          </div>
-          <div class="summary-row">
-            <span style="color:var(--text-muted);">Salinan Duplikat Dihapus:</span>
-            <span style="color:#f87171;" id="modalRedundantCount">0 file</span>
-          </div>
-          <div class="summary-row">
-            <span style="color:var(--text-muted);">File Asli Dipertahankan:</span>
-            <span style="color:#34d399;" id="modalKeptCount">0 file</span>
-          </div>
-          <div class="summary-row">
-            <span style="color:var(--text-muted);">File Sampah (.tmp) Dihapus:</span>
-            <span style="color:#f87171;" id="modalTmpCount">0 file</span>
-          </div>
-          <div class="summary-row">
-            <span>Total Ruang Akan Dibebaskan:</span>
-            <span style="color:#34d399; font-size:1.05rem;" id="modalSavingsAmount">0 MB</span>
-          </div>
-        </div>
+      <h3>Konfirmasi Pembersihan Harddisk Asli</h3>
+      <div class="modal-subtitle">
+        Tindakan ini akan <strong>LANGSUNG MENGHAPUS FILE DUPLIKAT DAN FILE .TMP</strong> dari harddisk asli pada folder:
+        <span class="modal-path-highlight font-mono" id="modalTargetFolderText"></span>
+      </div>
 
-        <p style="font-size:0.82rem; color:var(--text-muted); margin-bottom:10px;">
-          Daftar file salinan yang akan dieksekusi (dihapus langsung di tempat):
-        </p>
-        <div class="file-deletion-list" id="modalDeletionPreview">
-          <!-- Render list file yang akan dihapus -->
+      <div class="modal-stat-box font-mono">
+        <div class="modal-stat-row">
+          <span>Salinan Duplikat yang akan Dihapus:</span>
+          <span id="modalRedundantCount" style="color:#ffffff; font-weight:700;">21 file</span>
+        </div>
+        <div class="modal-stat-row">
+          <span>File Sampah Cache (.tmp):</span>
+          <span id="modalTmpCount" style="color:#ffffff; font-weight:700;">0 file</span>
+        </div>
+        <div class="modal-stat-row">
+          <span>Total File yang Dibersihkan Fisik:</span>
+          <span id="modalTotalCleanedCount" style="color:#ffffff; font-weight:700;">21 file</span>
+        </div>
+        <div class="modal-stat-row highlight-green">
+          <span>Ruang Harddisk yang Dipulihkan:</span>
+          <span class="val" id="modalSavingsText">18 MB</span>
         </div>
       </div>
-      <div class="modal-footer">
-        <button class="btn btn-secondary" onclick="closeModal()">Batal</button>
-        <button id="btnConfirmExecuteClean" class="btn btn-danger">
-          <span>Ya, Bersihkan Sekarang</span>
+
+      <div class="modal-guarantee-note">
+        💡 <strong>Garansi Keamanan:</strong> 1 File master asli per kelompok duplikat 100% dijamin tetap tersimpan rapi dan tidak akan terhapus.
+      </div>
+
+      <div class="modal-actions">
+        <button class="btn btn-header-secondary" onclick="closeCleanModal()">Batal</button>
+        <button id="btnExecuteClean" class="btn btn-clean-primary" onclick="confirmExecuteClean()">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+          <span>Ya, Bersihkan Langsung di Harddisk</span>
         </button>
       </div>
     </div>
   </div>
 
-  <!-- Toast Container -->
+  <!-- Modal Manual Input Path -->
+  <div id="manualPathModal" class="modal-backdrop">
+    <div class="modal-dialog">
+      <h3 style="margin-bottom:6px;">Input Path Folder Harddisk</h3>
+      <div class="modal-subtitle">
+        Ketik atau tempel path lengkap folder lokal di harddisk Anda yang ingin dipindai:
+      </div>
+      <div class="input-modal-box">
+        <input type="text" id="manualPathField" placeholder="Contoh: C:\\Users\\...\\Downloads_Lab atau ./Bahan Latihan P12">
+        <div class="presets-container">
+          <span style="font-size:0.72rem; color:var(--text-dim); display:flex; align-items:center;">Pilihan Cepat:</span>
+          <button class="preset-btn" onclick="applyPresetPath('C:/Users/Student/Desktop/Downloads_Lab')">Downloads_Lab (Desktop)</button>
+          <button class="preset-btn" onclick="applyPresetPath('./Bahan Latihan P12')">./Bahan Latihan P12</button>
+          <button class="preset-btn" onclick="applyPresetPath('.')">. (Workspace Root)</button>
+          <button class="preset-btn" style="color:#34d399;" onclick="handleResetSampleData()">Reset Bahan Uji</button>
+        </div>
+      </div>
+      <div class="modal-actions">
+        <button class="btn btn-header-secondary" onclick="closeManualPathModal()">Batal</button>
+        <button class="btn btn-browse-blue" onclick="submitManualPath()">
+          <span>Pindai Folder</span>
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast Notification Container -->
   <div id="toastContainer" class="toast-container"></div>
 
   <script>
     let currentAuditData = null;
+    let activeFolderPath = null;
 
-    // Toast utility
+    // Toast Generator
     function showToast(message, type = 'success') {
       const container = document.getElementById('toastContainer');
       const toast = document.createElement('div');
-      toast.className = 'toast toast-' + type;
+      toast.className = 'toast-item toast-' + type;
+
+      let iconHtml = '✓';
+      if (type === 'info') iconHtml = 'i';
+      if (type === 'error') iconHtml = '✕';
+
       toast.innerHTML = \`
-        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="\${type === 'success' ? '#10b981' : '#ef4444'}" stroke-width="2">
-          \${type === 'success' 
-            ? '<path d="M22 11.08V12a10 10 0 11-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/>' 
-            : '<circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>'}
-        </svg>
-        <div style="font-size:0.88rem; font-weight:500;">\${message}</div>
+        <div class="toast-icon">\${iconHtml}</div>
+        <div style="line-height:1.4;">\${message}</div>
       \`;
+
       container.appendChild(toast);
+
       setTimeout(() => {
         toast.style.opacity = '0';
         toast.style.transform = 'translateY(10px)';
-        toast.style.transition = 'all 0.3s ease';
         setTimeout(() => toast.remove(), 300);
-      }, 4000);
+      }, 4200);
     }
 
-    // Set Preset Path
-    function setPresetPath(p) {
-      document.getElementById('targetPathInput').value = p;
-      triggerScan();
+    // SVG icon helper sesuai format file
+    function getFileIconSVG(format) {
+      const f = (format || '').toUpperCase();
+      if (f === 'PDF') {
+        return \`<svg class="file-type-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>\`;
+      }
+      if (f === 'ZIP' || f === 'RAR' || f === '7Z' || f === 'TAR') {
+        return \`<svg class="file-type-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="12" y1="3" x2="12" y2="15"/><line x1="10" y1="5" x2="14" y2="5"/><line x1="10" y1="9" x2="14" y2="9"/><line x1="10" y1="13" x2="14" y2="13"/></svg>\`;
+      }
+      if (f === 'PPTX' || f === 'PPT') {
+        return \`<svg class="file-type-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 3h20v14H2z"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>\`;
+      }
+      if (f === 'MP4' || f === 'MKV' || f === 'AVI' || f === 'MOV') {
+        return \`<svg class="file-type-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="4" width="20" height="16" rx="2"/><polygon points="10 8 16 12 10 16 10 8"/></svg>\`;
+      }
+      if (f === 'DOCX' || f === 'DOC' || f === 'TXT') {
+        return \`<svg class="file-type-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/></svg>\`;
+      }
+      return \`<svg class="file-type-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><polyline points="13 2 13 9 20 9"/></svg>\`;
     }
 
-    // Tab Switching
-    function switchTab(tabId) {
-      document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
-      document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
-
-      document.getElementById(tabId).classList.add('active');
-      const activeBtn = Array.from(document.querySelectorAll('.tab-btn')).find(b => b.getAttribute('onclick').includes(tabId));
-      if (activeBtn) activeBtn.classList.add('active');
-    }
-
-    // Render Metrics & UI
-    function renderAudit(data) {
+    // Render Data Audit ke Antarmuka
+    function renderAuditResults(data) {
       currentAuditData = data;
-      document.getElementById('currentResolvedPath').textContent = data.resolvedTarget;
+      activeFolderPath = data.resolvedTarget;
 
-      // Update 4 Metrik Cards
-      document.getElementById('valTotalFiles').textContent = data.totalFiles.toLocaleString('id-ID');
-      document.getElementById('valTotalCapacity').textContent = data.totalCapacityMB;
-      document.getElementById('valTotalBytes').textContent = data.totalBytes.toLocaleString('id-ID') + ' bytes';
-      document.getElementById('valGiantFiles').textContent = data.giantCount;
-      document.getElementById('valPotentialSavings').textContent = data.potentialSavingsMB;
-      document.getElementById('valRedundantFilesCount').textContent = data.totalRedundantFiles + ' file duplikat + ' + data.tmpCount + ' file .tmp';
+      // Update Target Display Bar
+      const displayEl = document.getElementById('targetDisplayPath');
+      displayEl.textContent = data.resolvedTarget;
+      displayEl.className = 'target-path-display active font-mono';
 
-      // Update Tab Badges
-      document.getElementById('badgeGiantsCount').textContent = data.giantCount;
-      document.getElementById('badgeDuplicatesCount').textContent = data.duplicateGroupCount;
-      document.getElementById('badgeTmpCount').textContent = data.tmpCount;
+      // Sembunyikan Dashed Empty State Card
+      document.getElementById('emptyStateCard').style.display = 'none';
 
-      renderGiantFiles(data.giantFiles);
-      renderDuplicateGroups(data.duplicateGroups);
-      renderTmpFiles(data.tmpFiles);
+      // Update 4 Stat Metric Cards
+      document.getElementById('statTotalFiles').textContent = data.totalFiles;
+      document.getElementById('statTotalCapacity').textContent = data.totalCapacityMB;
+      document.getElementById('statGiantFiles').textContent = data.giantCount;
+      document.getElementById('statPotentialSavings').textContent = data.potentialSavingsMB;
+
+      // Update Badge Tabel File Raksasa
+      document.getElementById('badgeGiantCount').textContent = data.giantCount + ' file';
+
+      // Render Baris Tabel File Raksasa
+      renderGiantTable(data.giantFiles);
+
+      // Render Kelompok Duplikat di Bagian Bawah
+      document.getElementById('advancedSectionWrapper').style.display = 'block';
+      document.getElementById('badgeDupGroupCount').textContent = data.duplicateGroupCount + ' grup';
+      renderDuplicateAccordions(data.duplicateGroups);
     }
 
-    // Render Tabel File Raksasa (15 File)
-    function renderGiantFiles(list) {
+    // Render Tabel File Raksasa
+    function renderGiantTable(list) {
       const tbody = document.getElementById('giantTableBody');
       if (!list || list.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="6" class="empty-state">Tidak ada file raksasa (> 2 MB) ditemukan pada folder ini.</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="5" class="table-empty-row">Tidak ada file raksasa (&ge; 2 MB) ditemukan pada folder ini.</td></tr>';
         return;
       }
 
-      tbody.innerHTML = list.map((f, i) => \`
+      tbody.innerHTML = list.map(f => \`
         <tr>
-          <td style="color:var(--text-dim); font-weight:600;">\${i + 1}</td>
           <td>
-            <div class="file-name-cell">
-              <div class="file-type-icon">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V9z"/><polyline points="13 2 13 9 20 9"/></svg>
-              </div>
-              <div>
-                <div style="font-weight:600; color:#ffffff;">\${f.name}</div>
-                <div style="font-size:0.75rem; color:var(--text-dim); font-family:'JetBrains Mono';">\${f.hash.substring(0, 16)}...</div>
-              </div>
+            <div class="file-name-wrapper">
+              \${getFileIconSVG(f.format)}
+              <span class="file-name-text">\${f.name}</span>
             </div>
           </td>
-          <td style="font-weight:700; color:#fbbf24;">\${f.sizeMB}</td>
-          <td class="font-mono" style="color:var(--text-muted); font-size:0.82rem;">\${f.sizeKB}</td>
-          <td class="font-mono" style="font-size:0.78rem; color:var(--text-muted); max-width:240px; word-break:break-all;">\${f.relativePath}</td>
           <td>
-            <span class="badge badge-giant">&ge; 2 MB</span>
+            <div class="file-path-text font-mono">\${f.absolutePath}</div>
+          </td>
+          <td>
+            <div class="size-stacked font-mono">
+              <span class="size-stacked-num">\${f.sizeValue}</span>
+              <span class="size-stacked-unit">\${f.sizeUnit}</span>
+            </div>
+          </td>
+          <td>
+            <span class="format-badge">\${f.format}</span>
+          </td>
+          <td>
+            <span class="status-badge-boros">
+              <span>&ge; 2 MB</span>
+              <span class="status-sub">(Boros)</span>
+            </span>
           </td>
         </tr>
       \`).join('');
     }
 
-    function filterGiantsTable() {
-      const query = document.getElementById('searchGiant').value.toLowerCase();
+    // Search filter tabel file raksasa
+    function handleFilterGiants() {
       if (!currentAuditData) return;
+      const query = document.getElementById('giantSearchInput').value.toLowerCase();
       const filtered = currentAuditData.giantFiles.filter(f => 
-        f.name.toLowerCase().includes(query) || f.relativePath.toLowerCase().includes(query)
+        f.name.toLowerCase().includes(query) || f.absolutePath.toLowerCase().includes(query)
       );
-      renderGiantFiles(filtered);
+      renderGiantTable(filtered);
     }
 
-    // Render Kelompok Duplikat (20 Grup)
-    function renderDuplicateGroups(groups) {
+    // Render Accordion Kelompok Duplikat
+    function renderDuplicateAccordions(groups) {
       const container = document.getElementById('duplicateAccordionList');
       if (!groups || groups.length === 0) {
-        container.innerHTML = \`
-          <div class="empty-state">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 11-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
-            <h3 style="color:#34d399; font-weight:700;">Folder Bersih dari Duplikat!</h3>
-            <p style="font-size:0.85rem;">Tidak ditemukan file dengan hash SHA-256 kembar.</p>
-          </div>
-        \`;
+        container.innerHTML = '<div style="color:#10b981; font-weight:600; font-size:0.85rem; padding:10px 0;">✓ Bersih! Tidak ada file duplikat identik.</div>';
         return;
       }
 
       container.innerHTML = groups.map((g, idx) => \`
-        <div class="accordion-item \${idx === 0 ? 'open' : ''}" id="acc-group-\${g.groupId}">
-          <div class="accordion-header" onclick="toggleAccordion('acc-group-\${g.groupId}')">
-            <div class="group-left">
-              <span class="group-number">Grup #\${g.groupId}</span>
-              <div class="group-hash">
-                <span>SHA-256:</span>
-                <code>\${g.shortHash}</code>
-              </div>
-              <span class="badge badge-neutral">\${g.fileCount} File Identik</span>
+        <div class="accordion-item \${idx === 0 ? 'open' : ''}" id="acc-item-\${g.groupId}">
+          <div class="accordion-item-header" onclick="toggleAccItem('acc-item-\${g.groupId}')">
+            <div style="display:flex; align-items:center; gap:12px;">
+              <span style="font-weight:700; color:#ffffff; font-size:0.85rem;">Grup #\${g.groupId}</span>
+              <code style="font-size:0.75rem; color:#94a3b8; background:rgba(255,255,255,0.06); padding:2px 8px; border-radius:4px;">\${g.shortHash}</code>
+              <span style="font-size:0.74rem; color:#cbd5e1;">\${g.fileCount} File Kembar</span>
             </div>
-            <div class="group-right">
-              <div style="text-align:right;">
-                <div style="font-size:0.85rem; font-weight:700; color:var(--text-main);">\${g.sizeMB} per file</div>
-                <div style="font-size:0.75rem; color:#34d399; font-weight:600;">Potensi Hemat: \${g.savingsMB}</div>
-              </div>
-              <svg class="chevron-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
+            <div style="display:flex; align-items:center; gap:14px;">
+              <span style="font-size:0.76rem; color:#10b981; font-weight:700;">Hemat: \${g.savingsMB}</span>
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
             </div>
           </div>
-          <div class="accordion-body">
-            <div class="file-tree">
-              \${g.files.map(f => \`
-                <div class="file-tree-item \${f.isOriginal ? 'is-original' : 'is-duplicate'}">
-                  <div class="file-info-col">
-                    <div class="file-info-name" style="color: \${f.isOriginal ? '#ffffff' : '#f87171'};">\${f.name}</div>
-                    <div class="file-info-path font-mono">\${f.absolutePath}</div>
-                  </div>
-                  <div>
-                    \${f.isOriginal 
-                      ? '<span class="badge badge-original"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg> ASLI (DIPERTAHANKAN)</span>' 
-                      : '<span class="badge badge-duplicate"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg> SALINAN KEMBAR (AKAN DIHAPUS)</span>'}
-                  </div>
+          <div class="accordion-item-body">
+            \${g.files.map(f => \`
+              <div class="file-tree-row">
+                <div style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:75%;">
+                  <span style="font-weight:600; color:\${f.isOriginal ? '#ffffff' : '#f87171'};">\${f.name}</span>
+                  <span class="font-mono" style="font-size:0.72rem; color:var(--text-dim); margin-left:8px;">\${f.absolutePath}</span>
                 </div>
-              \`).join('')}
-            </div>
+                <div>
+                  \${f.isOriginal 
+                    ? '<span class="badge-original">✓ ASLI (DIPERTAHANKAN)</span>' 
+                    : '<span class="badge-duplicate">✕ SALINAN KEMBAR (AKAN DIHAPUS)</span>'}
+                </div>
+              </div>
+            \`).join('')}
           </div>
         </div>
       \`).join('');
     }
 
-    function toggleAccordion(id) {
+    function toggleAccItem(id) {
       const el = document.getElementById(id);
       if (el) el.classList.toggle('open');
     }
 
-    function toggleAllAccordions(open) {
-      document.querySelectorAll('.accordion-item').forEach(el => {
-        if (open) el.classList.add('open');
-        else el.classList.remove('open');
-      });
-    }
-
-    function filterDuplicates() {
-      const q = document.getElementById('searchDups').value.toLowerCase();
-      if (!currentAuditData) return;
-      const filtered = currentAuditData.duplicateGroups.filter(g => 
-        g.hash.toLowerCase().includes(q) ||
-        g.files.some(f => f.name.toLowerCase().includes(q) || f.absolutePath.toLowerCase().includes(q))
-      );
-      renderDuplicateGroups(filtered);
-    }
-
-    // Render File Sampah
-    function renderTmpFiles(list) {
-      const tbody = document.getElementById('tmpTableBody');
-      if (!list || list.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="5" class="empty-state">Tidak ada file sampah sementara (.tmp) ditemukan.</td></tr>';
-        return;
+    function toggleAdvancedSection() {
+      const content = document.getElementById('advancedContent');
+      const arrow = document.getElementById('arrowToggleAdvanced');
+      const txt = document.getElementById('txtToggleAdvanced');
+      content.classList.toggle('open');
+      if (content.classList.contains('open')) {
+        arrow.style.transform = 'rotate(180deg)';
+        txt.textContent = 'Sembunyikan rincian';
+      } else {
+        arrow.style.transform = 'rotate(0deg)';
+        txt.textContent = 'Klik untuk melihat detail file duplikat';
       }
-      tbody.innerHTML = list.map((t, i) => \`
-        <tr>
-          <td style="color:var(--text-dim); font-weight:600;">\${i+1}</td>
-          <td style="font-weight:600; color:#f87171;">\${t.name}</td>
-          <td class="font-mono">\${t.sizeKB}</td>
-          <td class="font-mono" style="font-size:0.75rem; color:var(--text-muted);">\${t.absolutePath}</td>
-          <td><span class="badge badge-duplicate">File Sampah .tmp</span></td>
-        </tr>
-      \`).join('');
     }
 
-    // Trigger API Scan
-    async function triggerScan() {
-      const folderPath = document.getElementById('targetPathInput').value.trim();
-      const btn = document.getElementById('btnScan');
-      const origText = btn.innerHTML;
-      btn.disabled = true;
-      btn.innerHTML = '<div class="spinner"></div><span>Memindai...</span>';
-
+    // Pindai folder via API
+    async function scanFolderAPI(folderPath) {
       try {
         const res = await fetch('/api/scan', {
           method: 'POST',
@@ -1682,127 +1779,194 @@ function getHTMLTemplate() {
         if (!res.ok || !result.success) {
           throw new Error(result.error || 'Gagal memindai folder');
         }
-        renderAudit(result.data);
-        showToast('Penyimpanan berhasil dipindai! Ditemukan ' + result.data.totalFiles + ' file.');
+        renderAuditResults(result.data);
       } catch (err) {
         showToast(err.message, 'error');
-      } finally {
-        btn.disabled = false;
-        btn.innerHTML = origText;
       }
     }
 
-    // Modal Confirmation Handlers
-    document.getElementById('btnCleanModal').addEventListener('click', () => {
-      if (!currentAuditData) {
-        showToast('Silakan lakukan pemindaian folder terlebih dahulu.', 'error');
-        return;
+    // Pemicu 1: Browse Folder Dialog OS (Windows/Mac)
+    async function triggerBrowseOS() {
+      showToast('Membuka dialog pemilihan folder di sistem operasi...', 'info');
+      try {
+        const res = await fetch('/api/browse-folder', { method: 'POST' });
+        const result = await res.json();
+        if (result.success && result.folderPath) {
+          const folderName = result.folderPath.split(/[\\\\/]/).filter(Boolean).pop();
+          showToast(\`Mencari lokasi fisik folder '\${folderName}' di harddisk...\`, 'info');
+          setTimeout(() => {
+            showToast(\`Berhasil terhubung langsung ke harddisk: \${result.folderPath}\`, 'success');
+            scanFolderAPI(result.folderPath);
+          }, 400);
+        } else if (result.error && !result.error.includes('dibatalkan')) {
+          showToast(result.error, 'error');
+        }
+      } catch (e) {
+        showToast('Gagal memicu dialog folder OS: ' + e.message, 'error');
       }
-
-      const redundantCount = currentAuditData.totalRedundantFiles;
-      const tmpCount = currentAuditData.tmpCount;
-      const totalDeletions = redundantCount + tmpCount;
-
-      if (totalDeletions === 0) {
-        showToast('Folder target sudah bersih! Tidak ada file duplikat atau .tmp untuk dibersihkan.', 'success');
-        return;
-      }
-
-      document.getElementById('modalTargetFolder').textContent = currentAuditData.targetFolder;
-      document.getElementById('modalRedundantCount').textContent = redundantCount + ' file';
-      document.getElementById('modalKeptCount').textContent = currentAuditData.duplicateGroupCount + ' file';
-      document.getElementById('modalTmpCount').textContent = tmpCount + ' file';
-      document.getElementById('modalSavingsAmount').textContent = currentAuditData.potentialSavingsMB;
-
-      // Populate file preview deletion list
-      const delList = [];
-      currentAuditData.duplicateGroups.forEach(g => {
-        g.files.forEach(f => {
-          if (!f.isOriginal) {
-            delList.push({ name: f.name, path: f.absolutePath, type: 'Salinan Duplikat' });
-          }
-        });
-      });
-      currentAuditData.tmpFiles.forEach(t => {
-        delList.push({ name: t.name, path: t.absolutePath, type: 'File .tmp' });
-      });
-
-      document.getElementById('modalDeletionPreview').innerHTML = delList.map(item => \`
-        <div class="del-item font-mono">
-          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6"/></svg>
-          <span>[\${item.type}] \${item.name}</span>
-        </div>
-      \`).join('');
-
-      document.getElementById('confirmModal').classList.add('show');
-    });
-
-    function closeModal() {
-      document.getElementById('confirmModal').classList.remove('show');
     }
 
-    // Execute Clean In-Place
-    document.getElementById('btnConfirmExecuteClean').addEventListener('click', async () => {
-      const btn = document.getElementById('btnConfirmExecuteClean');
-      const origText = btn.innerHTML;
-      btn.disabled = true;
-      btn.innerHTML = '<div class="spinner"></div><span>Membersihkan di tempat...</span>';
+    // Pemicu 2: HTML5 File Input Picker (Pilih / Upload Folder)
+    function triggerHTML5Upload() {
+      document.getElementById('osFolderPickerInput').click();
+    }
+
+    async function handleFolderSelected(e) {
+      const files = e.target.files;
+      if (!files || files.length === 0) return;
+
+      const firstRel = files[0].webkitRelativePath || '';
+      const folderName = firstRel.split('/')[0] || 'Downloads_Lab';
+
+      showToast(\`Mencari lokasi fisik folder '\${folderName}' di harddisk...\`, 'info');
 
       try {
-        const folderPath = document.getElementById('targetPathInput').value.trim();
+        const res = await fetch('/api/resolve-folder', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ folderName })
+        });
+        const result = await res.json();
+
+        if (result.success && result.folderPath) {
+          setTimeout(() => {
+            showToast(\`Berhasil terhubung langsung ke harddisk: \${result.folderPath}\`, 'success');
+            scanFolderAPI(result.folderPath);
+          }, 350);
+        } else {
+          showToast(\`Folder '\${folderName}' dipilih. Membuka konfirmasi path...\`, 'info');
+          openManualPathModal(folderName);
+        }
+      } catch (err) {
+        showToast(err.message, 'error');
+      }
+
+      // Reset file input agar bisa dipilih ulang
+      e.target.value = '';
+    }
+
+    // Pemicu 3: Input Path Manual
+    function openManualPathModal(prefill) {
+      const field = document.getElementById('manualPathField');
+      if (prefill) {
+        field.value = prefill;
+      } else if (activeFolderPath) {
+        field.value = activeFolderPath;
+      } else {
+        field.value = 'C:/Users/Student/Desktop/Downloads_Lab';
+      }
+      document.getElementById('manualPathModal').classList.add('show');
+    }
+
+    function closeManualPathModal() {
+      document.getElementById('manualPathModal').classList.remove('show');
+    }
+
+    function applyPresetPath(p) {
+      document.getElementById('manualPathField').value = p;
+    }
+
+    function submitManualPath() {
+      const val = document.getElementById('manualPathField').value.trim();
+      if (!val) {
+        showToast('Silakan masukkan path folder target.', 'error');
+        return;
+      }
+      closeManualPathModal();
+      showToast(\`Berhasil terhubung langsung ke harddisk: \${val}\`, 'success');
+      scanFolderAPI(val);
+    }
+
+    // Pindai Ulang
+    function handleRescan() {
+      if (!activeFolderPath) {
+        showToast('Belum ada folder yang dipilih. Silakan pilih folder terlebih dahulu.', 'error');
+        return;
+      }
+      showToast(\`Memindai ulang folder: \${activeFolderPath}...\`, 'info');
+      scanFolderAPI(activeFolderPath);
+    }
+
+    // Modal Konfirmasi Bersihkan
+    function openCleanModal() {
+      if (!currentAuditData) {
+        showToast('Silakan pilih dan pindai folder terlebih dahulu sebelum membersihkan.', 'error');
+        return;
+      }
+
+      const redundant = currentAuditData.totalRedundantFiles;
+      const tmp = currentAuditData.tmpCount;
+      const total = redundant + tmp;
+
+      if (total === 0) {
+        showToast('Folder target sudah bersih! Tidak ada file duplikat atau sampah untuk dibersihkan.', 'success');
+        return;
+      }
+
+      document.getElementById('modalTargetFolderText').textContent = activeFolderPath;
+      document.getElementById('modalRedundantCount').textContent = redundant + ' file';
+      document.getElementById('modalTmpCount').textContent = tmp + ' file';
+      document.getElementById('modalTotalCleanedCount').textContent = total + ' file';
+      document.getElementById('modalSavingsText').textContent = currentAuditData.potentialSavingsMB;
+
+      document.getElementById('cleanConfirmModal').classList.add('show');
+    }
+
+    function closeCleanModal() {
+      document.getElementById('cleanConfirmModal').classList.remove('show');
+    }
+
+    // Eksekusi Bersihkan Langsung di Harddisk
+    async function confirmExecuteClean() {
+      const btn = document.getElementById('btnExecuteClean');
+      const origHtml = btn.innerHTML;
+      btn.disabled = true;
+      btn.innerHTML = '<div class="spinner"></div><span>Membersihkan di harddisk...</span>';
+
+      try {
         const res = await fetch('/api/clean', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ folderPath })
+          body: JSON.stringify({ folderPath: activeFolderPath })
         });
         const result = await res.json();
         if (!res.ok || !result.success) {
           throw new Error(result.error || 'Gagal mengeksekusi pembersihan.');
         }
 
-        closeModal();
-        renderAudit(result.data.updatedAudit);
-        showToast(\`Berhasil membersihkan \${result.data.deletedCount} file! Ruang dibebaskan: \${result.data.freedMB}.\`, 'success');
+        closeCleanModal();
+        renderAuditResults(result.data.updatedAudit);
+        showToast(\`SUKSES RIIL! \${result.data.deletedCount} file telah dihapus langsung dari harddisk (\${result.data.freedMB} ruang pulih).\`, 'success');
       } catch (err) {
         showToast(err.message, 'error');
       } finally {
         btn.disabled = false;
-        btn.innerHTML = origText;
+        btn.innerHTML = origHtml;
       }
-    });
+    }
 
-    // Reset / Restore Sample Data Helper
-    async function restoreLabData() {
-      if (!confirm('Apakah Anda ingin mereset/mengembalikan file latihan asli ke folder target?')) return;
+    // Reset Sample Data Helper
+    async function handleResetSampleData() {
+      if (!confirm('Apakah Anda ingin mereset/mengembalikan file bahan uji asli ke folder target?')) return;
       try {
-        const folderPath = document.getElementById('targetPathInput').value.trim();
+        const target = document.getElementById('manualPathField').value.trim() || activeFolderPath || 'C:/Users/Student/Desktop/Downloads_Lab';
         const res = await fetch('/api/restore', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ folderPath })
+          body: JSON.stringify({ folderPath: target })
         });
         const r = await res.json();
         if (r.success) {
           showToast('Data latihan berhasil dipulihkan!');
-          triggerScan();
+          closeManualPathModal();
+          scanFolderAPI(target);
         } else {
-          showToast(r.error || 'Gagal merestore file latihan', 'error');
+          showToast(r.error || 'Gagal merestore data latihan.', 'error');
         }
       } catch (e) {
         showToast(e.message, 'error');
       }
     }
-
-    // Keyboard & Events
-    document.getElementById('btnScan').addEventListener('click', triggerScan);
-    document.getElementById('targetPathInput').addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') triggerScan();
-    });
-
-    // Auto scan saat pertama load
-    window.addEventListener('DOMContentLoaded', () => {
-      triggerScan();
-    });
   </script>
 </body>
 </html>`;
@@ -1884,6 +2048,33 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // POST atau GET /api/browse-folder - Buka Dialog Folder OS
+  if ((req.method === 'POST' || req.method === 'GET') && url.pathname === '/api/browse-folder') {
+    openOSFolderDialog((err, selectedPath) => {
+      if (err) {
+        sendJSON(200, { success: false, error: err.message });
+      } else {
+        sendJSON(200, { success: true, folderPath: selectedPath });
+      }
+    });
+    return;
+  }
+
+  // POST /api/resolve-folder - Cari lokasi fisik folder di harddisk jika user memilih lewat HTML5 picker
+  if (req.method === 'POST' && url.pathname === '/api/resolve-folder') {
+    parseBody((err, data) => {
+      if (err) return sendJSON(400, { success: false, error: 'Format JSON tidak valid' });
+      const folderName = (data && data.folderName) ? data.folderName.trim() : '';
+      const resolved = resolveFolderOnDisk(folderName);
+      if (resolved) {
+        sendJSON(200, { success: true, folderPath: resolved });
+      } else {
+        sendJSON(200, { success: false, message: 'Folder tidak ditemukan otomatis di lokasi standar' });
+      }
+    });
+    return;
+  }
+
   // POST /api/restore - Mengembalikan bahan latihan asli untuk kemudahan re-testing
   if (req.method === 'POST' && url.pathname === '/api/restore') {
     parseBody((err, data) => {
@@ -1921,9 +2112,9 @@ function openBrowser(targetUrl) {
 server.listen(PORT, () => {
   const localUrl = `http://localhost:${PORT}`;
   console.log(`================================================================`);
-  console.log(`  StorageAudit Pro - Server Berjalan di ${localUrl}`);
+  console.log(`  Storage Audit & Cleaner - Server Berjalan di ${localUrl}`);
   console.log(`  Target Default: ${DEFAULT_TARGET_DIR}`);
-  console.log(`  Modul Native Node.js: http, fs, path, crypto (Tanpa npm install)`);
+  console.log(`  Modul Native Node.js: http, fs, path, crypto, os, child_process`);
   console.log(`================================================================`);
   openBrowser(localUrl);
 });
